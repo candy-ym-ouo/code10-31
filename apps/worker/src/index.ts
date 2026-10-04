@@ -10,6 +10,7 @@ import { prisma } from "./lib/prisma.js";
 import { deleteObject, getObjectStream, putObject } from "./lib/s3.js";
 import { generatePeaks, probeAudio } from "./lib/media.js";
 import { buildUserExport } from "./lib/export.js";
+import { OVERDUE_SCAN_INTERVAL_MS, scanOverdueGoals } from "./lib/goals.js";
 
 const config = getConfig();
 const redis = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null });
@@ -112,17 +113,16 @@ async function exportData(exportId: string) {
   }
 }
 
-async function scanOverdueGoals() {
-  const startOfToday = new Date();
-  startOfToday.setUTCHours(0, 0, 0, 0);
-  const result = await prisma.goal.updateMany({
-    where: {
-      dueDate: { lt: startOfToday },
-      status: { in: ["OPEN", "IN_PROGRESS"] },
-    },
-    data: { status: "MISSED" },
-  });
-  if (result.count > 0) log("info", { count: result.count }, "overdue goals marked missed");
+async function runOverdueScan() {
+  try {
+    const result = await scanOverdueGoals();
+    if (result.marked > 0) log("info", { count: result.marked }, "overdue goals marked missed");
+    if (result.skippedTimezones.length > 0) {
+      log("warn", { timezones: result.skippedTimezones }, "overdue scan skipped invalid timezones");
+    }
+  } catch (error) {
+    log("error", { err: error instanceof Error ? error.message : String(error) }, "overdue scan failed");
+  }
 }
 
 const worker = new Worker(
@@ -143,10 +143,10 @@ const heartbeat = setInterval(async () => {
   await redis.set("worker:heartbeat", new Date().toISOString(), "EX", 30);
 }, 10_000);
 await redis.set("worker:heartbeat", new Date().toISOString(), "EX", 30);
-await scanOverdueGoals().catch((error) => log("error", { err: error instanceof Error ? error.message : String(error) }, "overdue scan failed"));
+await runOverdueScan();
 const overdueInterval = setInterval(() => {
-  void scanOverdueGoals().catch((error) => log("error", { err: error instanceof Error ? error.message : String(error) }, "overdue scan failed"));
-}, 24 * 60 * 60_000);
+  void runOverdueScan();
+}, OVERDUE_SCAN_INTERVAL_MS);
 
 async function shutdown(signal: string) {
   log("info", { signal }, "shutting down worker");
