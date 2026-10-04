@@ -10,6 +10,7 @@ import { prisma } from "./lib/prisma.js";
 import { deleteObject, getObjectStream, putObject } from "./lib/s3.js";
 import { generatePeaks, probeAudio } from "./lib/media.js";
 import { buildUserExport } from "./lib/export.js";
+import { OVERDUE_SCAN_INTERVAL_MS, scanOverdueGoals } from "./lib/overdue-goals.js";
 
 const config = getConfig();
 const redis = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null });
@@ -112,17 +113,13 @@ async function exportData(exportId: string) {
   }
 }
 
-async function scanOverdueGoals() {
-  const startOfToday = new Date();
-  startOfToday.setUTCHours(0, 0, 0, 0);
-  const result = await prisma.goal.updateMany({
-    where: {
-      dueDate: { lt: startOfToday },
-      status: { in: ["OPEN", "IN_PROGRESS"] },
-    },
-    data: { status: "MISSED" },
+async function runOverdueScan() {
+  const count = await scanOverdueGoals(prisma, new Date(), {
+    info: (data, message) => log("info", data, message),
+    warn: (data, message) => log("warn", data, message),
+    error: (data, message) => log("error", data, message),
   });
-  if (result.count > 0) log("info", { count: result.count }, "overdue goals marked missed");
+  return count;
 }
 
 const worker = new Worker(
@@ -143,10 +140,10 @@ const heartbeat = setInterval(async () => {
   await redis.set("worker:heartbeat", new Date().toISOString(), "EX", 30);
 }, 10_000);
 await redis.set("worker:heartbeat", new Date().toISOString(), "EX", 30);
-await scanOverdueGoals().catch((error) => log("error", { err: error instanceof Error ? error.message : String(error) }, "overdue scan failed"));
+await runOverdueScan().catch((error) => log("error", { err: error instanceof Error ? error.message : String(error) }, "overdue scan failed"));
 const overdueInterval = setInterval(() => {
-  void scanOverdueGoals().catch((error) => log("error", { err: error instanceof Error ? error.message : String(error) }, "overdue scan failed"));
-}, 24 * 60 * 60_000);
+  void runOverdueScan().catch((error) => log("error", { err: error instanceof Error ? error.message : String(error) }, "overdue scan failed"));
+}, OVERDUE_SCAN_INTERVAL_MS);
 
 async function shutdown(signal: string) {
   log("info", { signal }, "shutting down worker");
